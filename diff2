@@ -1,0 +1,682 @@
+const {
+    request
+} = require("@octokit/request");
+const {
+    createAppAuth
+} = require("@octokit/auth-app");
+const {
+    Octokit
+} = require("@octokit/core");
+let {
+    graphql
+} = require("@octokit/graphql");
+const {
+    paginateRest,
+    composePaginateRest,
+} = require("@octokit/plugin-paginate-rest");
+
+require("dotenv").config();
+const _colors = require("colors");
+const cliProgress = require('cli-progress');
+const write = require("write");
+const {
+    forEach
+} = require("lodash");
+const Json2csvParser = require("json2csv").Parser;
+
+const outputPath = "alerts/";
+var outputFile = []
+var GHES_HOSTNAME = "github.com"
+
+const PRIVATE_KEY = process.env.PRIVATE_KEY
+const APP_ID = process.env.APP_ID
+const CLIENT_ID = process.env.CLIENT_ID
+const CLIENT_SECRET = process.env.CLIENT_SECRET
+const orgarraylogin = process.env.ORGS.split(" ");
+
+var installationGitHubData = []
+var dependabotAlertsReposResults = []
+
+const auth = createAppAuth({
+    appId: `${APP_ID}`,
+    privateKey: `${PRIVATE_KEY}`,
+    clientId: `${CLIENT_ID}`,
+    clientSecret: `${CLIENT_SECRET}`,
+});
+
+var repoquery = {
+    query: `query($organizationSlug: String!, $cursor: String) {
+        organization(login: $organizationSlug) {
+            repositories(first: 100, after: $cursor) {
+                totalCount
+                nodes {
+                    name
+                    owner {
+                        login
+                    }
+                }
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+        }
+    }`,
+    _queryname: 'repoquery'
+};
+
+var dependabotquery = {
+    query: `query ($reponame: String!, $owner: String!, $cursor: String ) {
+            repository(name: $reponame, owner: $owner) { 
+            vulnerabilityAlerts(first: 100, after: $cursor) {
+            nodes {
+                createdAt 
+                dismissedAt
+                fixedAt
+                dismissReason
+                    state
+                    securityVulnerability {
+                    package {
+                        ecosystem
+                        name 
+                    } 
+                        firstPatchedVersion {
+                            identifier
+                        }
+                    severity 
+                    vulnerableVersionRange 
+                    advisory {
+                        description
+                        summary
+                        ghsaId 
+                        publishedAt 
+                        identifiers { 
+                            type 
+                            value 
+                        } 
+                    } 
+                } 
+            }
+                totalCount
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            } 
+        }
+      }`,
+    _queryname: 'dependabotquery',
+};
+
+
+var dependabotalertstotal = {
+    query: `query ($reponame: String!, $owner: String!) {
+                repository(name: $reponame, owner: $owner) { 
+                    vulnerabilityAlerts(first: 100) {
+                        totalCount
+                    } 
+                }
+            }`,
+    _queryname: 'dependabotalertstotal',
+};
+
+async function getAppInstallationToken() {
+    try {
+        const requestWithAuth = request.defaults({
+            request: {
+                hook: auth.hook,
+            },
+        });
+        const {
+            data: installations
+        } = await requestWithAuth("GET /app/installations");
+        for (var i = 0; i < installations.length; i++) {
+            if ('Organization' == installations[i].account.type) {
+
+                const {
+                    data: access_token
+                } = await requestWithAuth(`POST /app/installations/${installations[i].id}/access_tokens`);
+                var accessToken = access_token.token
+                installationGitHubData.push({
+                    accountLogin: installations[i].account.login,
+                    accessToken: accessToken
+                })
+            }
+        }
+        return installationGitHubData
+
+    } catch (err) {
+        console.log("Request failed:" + err);
+    }
+}
+
+async function getRepos(org) {
+    try {
+        var repos = []
+        var token
+        var appData = await getAppInstallationToken()
+
+        for (var i = 0; i < appData.length; i++) {
+            if (appData[i].accountLogin == org) {
+                token = appData[i].accessToken
+            }
+        }
+
+        if (process.env.GHE == "GHES") {
+            graphqlDefaults = {
+                baseUrl: `https://${hostname}/api`,
+                headers: {
+                    authorization: `token ${token}`,
+                },
+            };
+        } else {
+            graphqlDefaults = {
+                headers: {
+                    authorization: `token ${token}`,
+                },
+            };
+        }
+        graphql = graphql.defaults(graphqlDefaults);
+
+        repoquery.organizationSlug = org
+        delete repoquery['cursor']
+        hasNext = true
+        while (hasNext) {
+            var result = await graphql(repoquery);
+            var l = JSON.parse(JSON.stringify(result)).organization.repositories.nodes.length
+            repoquery.cursor = result.organization.repositories.pageInfo.endCursor;
+            var hasNext = JSON.parse(JSON.stringify(result)).organization.repositories.pageInfo.hasNextPage
+            for (j = 0; j < l; j++) {
+                repos.push(result.organization.repositories.nodes[j])
+            }
+
+        }
+        return (repos)
+
+    } catch (error) {
+        console.log("Request failed:", error);
+    }
+}
+
+async function getDependabotAlerts() {
+    try {
+        var repos = []
+        var token
+
+        for (var i = 0; i < orgarraylogin.length; i++) {
+            console.log("\nGetting the List of Repositories for " + orgarraylogin[i])
+            
+            var repos = await getRepos(orgarraylogin[i])
+            console.log("Completed Repo for " + orgarraylogin[i])
+
+            getOrgAdmin = true
+
+            increment = 20
+            count = 0
+
+            metrics_data = []
+            var orgadmins = []
+
+            for (var k = 0; k < Math.ceil(repos.length / increment); k++) {
+
+                var appData = await getAppInstallationToken()
+
+                for (var q = 0; q < appData.length; q++) {
+                    if (appData[q].accountLogin == orgarraylogin[i]) {
+                        token = appData[q].accessToken
+                    }
+                }
+    
+                const MyOctokit = Octokit.plugin(paginateRest);
+                const octokit = new MyOctokit({
+                    auth: token
+                });
+
+                if ( getOrgAdmin ) {
+                    var orgadmin = await octokit.request("GET /orgs/{owner}/members?role=admin", {
+                        owner: orgarraylogin[i]
+                    });
+
+                    if ( orgadmin.data ) {
+                        orgadmin.data.forEach ( admin => {
+                            //console.log(admin)
+                            orgadmins.push(admin.login)
+                        })
+                    }
+                    getOrgAdmin = false
+                    console.log(orgadmins)
+                }
+                
+                let repoPath = []
+
+                var dependabotQueryRepos = []
+                var zerodependabotAlertsRepos = []
+                var dependabotAlertsPromiseRepos = []
+                var dependabotAlertsRepos = []
+
+                for (var j = 0; j < increment; j++) {
+                    repoPath[j] = repos[count].owner.login + "/" + repos[count].name
+                    if (k == Math.ceil(repos.length / increment) - 1 && j == repos.length % increment - 1) {
+                        break
+                    }
+                    count++
+                }
+
+                repoData = await Promise.all(repoPath.map((full_name) => {
+                    const promise = octokit.request("GET /repos/{owner}/{repo}", {
+                        owner: full_name.split("/")[0],
+                        repo: full_name.split("/")[1]
+                    });
+                    return promise;
+                }));
+
+                repoCollaborators = await Promise.all(repoPath.map((full_name) => {
+                    const promise = octokit.request("GET /repos/{owner}/{repo}/collaborators", {
+                        owner: full_name.split("/")[0],
+                        repo: full_name.split("/")[1]
+                    });
+                    return promise;
+                }));
+
+                for (var j = 0; j < repoData.length; j++) {
+                    advanced_security_status = repoData[j].data.security_and_analysis.advanced_security.status
+                    secret_scanning_status = repoData[j].data.security_and_analysis.secret_scanning.status
+                    push_protection_status = repoData[j].data.security_and_analysis.secret_scanning_push_protection.status
+
+                    repoTopicArray = repoData[j].data.topics
+                    repoTopic = ''
+                    for ( var t = 0; t < repoTopicArray.length; t++ ) {
+                        if (repoTopic == '') {
+                            repoTopic += repoTopicArray[t]
+                        }
+                        else {
+                            repoTopic += ', ' +repoTopicArray[t]
+                        } 
+                    }
+
+                    repoAdmin = repoCollaborators[j].data
+                    var repoAdminName = ''
+                    var repoPushPermission = ''
+                    var repoPullPermission = ''
+
+                    for (var z = 0; z < repoAdmin.length; z++) {
+                        //console.log(repoAdmin[z].permissions)
+                        if (repoAdmin[z].permissions.admin == true) {
+                            
+                            //console.log(repoAdmin[z].login)
+                            if ( orgadmins.includes(repoAdmin[z].login) ) {
+                                continue
+                            }
+
+                            if (repoAdminName == '') {
+                                repoAdminName += repoAdmin[z].login
+                            } else {
+                                repoAdminName += ', ' + repoAdmin[z].login
+                            }
+                        }
+                        
+                        if (repoAdmin[z].permissions.push == true) {
+                            if (repoPushPermission == '') {
+                                repoPushPermission += repoAdmin[z].login
+                            } else {
+                                repoPushPermission += ', ' + repoAdmin[z].login
+                            }
+                        }
+
+                        if (repoAdmin[z].permissions.pull == true) {
+                            if (repoPullPermission == '') {
+                                repoPullPermission += repoAdmin[z].login
+                            } else {
+                                repoPullPermission += ', ' + repoAdmin[z].login
+                            }
+                        }
+                    }
+
+                    metrics_data.push({
+                        "repository": repoData[j].data.name,
+                        "organization": repoData[j].data.owner.login,
+                        "advanced_security_status": advanced_security_status,
+                        "secret_scanning_status": secret_scanning_status,
+                        "push_protection_status": push_protection_status,
+                        "repoTopic": repoTopic,
+                        "repoAdmin": repoAdminName,
+                        "repoPushPermission" : repoPushPermission,
+                        "repoPullPermission" : repoPullPermission,
+
+                    })
+                }
+
+                dependabotEnabledRepos = await Promise.all(repoPath.map((full_name) => {
+                    const promise = octokit.request("GET /repos/{owner}/{repo}/vulnerability-alerts", {
+                        owner: full_name.split("/")[0],
+                        repo: full_name.split("/")[1]
+                    });
+                    return promise.then(function (result) {
+                        return result;
+                    }).catch(function (error) {
+                        return error.response;
+                    });
+                }));
+
+                dependabotEnabledRepos.forEach(element => {
+                    if (element.status == 204) {
+                        organization = element.url.split("/")[4]
+                        repository = element.url.split("/")[5]
+                        dependabotQueryRepos.push({
+                            organization: organization,
+                            repository: repository
+                        })
+                    } else if (element.status == 404) {
+                        // console.log("Dependabot is not enabled for this repository " + element.url.split("/")[4] + "/" + element.url.split("/")[5])
+                    } else {
+                        console.log("Error in getting the Dependabot Alerts for " + element.url.split("/")[4] + "/" + element.url.split("/")[5])
+                    }
+                });
+
+                if (process.env.GHE == "GHES") {
+                    graphqlDefaults = {
+                        baseUrl: `https://${hostname}/api`,
+                        headers: {
+                            authorization: `token ${token}`,
+                        },
+                    };
+                } else {
+                    graphqlDefaults = {
+                        headers: {
+                            authorization: `token ${token}`,
+                        },
+                    };
+                }
+                graphql = graphql.defaults(graphqlDefaults);
+
+                totalCount = await Promise.all(dependabotQueryRepos.map((full_name) => {
+                    const promise = graphql(`
+                    query {
+                        repository(owner: "${full_name.organization}", name: "${full_name.repository}") {
+                            name
+                            owner {
+                                login
+                            }
+                            vulnerabilityAlerts(first: 1) {
+                                totalCount
+                                }
+                            }
+                        }`);
+                    return promise.then(function (result) {
+                        return result;
+                    }).catch(function (error) {
+                        return error.response;
+                    });
+                }));
+
+                totalCount.forEach(element => {
+                    // console.log(element.repository)
+
+                    if (element.repository.vulnerabilityAlerts.totalCount == 0) {
+                        zerodependabotAlertsRepos.push({
+                            organization: element.repository.owner.login,
+                            repository: element.repository.name
+                        })
+                    } else if (element.repository.vulnerabilityAlerts.totalCount > 0 && element.repository.vulnerabilityAlerts.totalCount <= 100) {
+                        dependabotAlertsPromiseRepos.push({
+                            organization: element.repository.owner.login,
+                            repository: element.repository.name
+                        })
+                    } else if (element.repository.vulnerabilityAlerts.totalCount > 100) {
+                        dependabotAlertsRepos.push({
+                            organization: element.repository.owner.login,
+                            repository: element.repository.name
+                        })
+                    }
+                });
+
+                // console.log(dependabotAlertsRepos)
+
+                dependabotAlertsPromiseReposResults = await Promise.all(dependabotAlertsPromiseRepos.map((full_name) => {
+                    const promise = graphql(`
+                    query {
+                        repository(owner: "${full_name.organization}", name: "${full_name.repository}") {
+                            name
+                            owner {
+                                login
+                            }
+                            vulnerabilityAlerts(first: 100) {
+                                nodes {
+                                    createdAt 
+                                    dismissedAt
+                                    fixedAt
+                                    dismissReason
+                                        state
+                                        securityVulnerability {
+                                        package {
+                                            ecosystem
+                                            name 
+                                        } 
+                                            firstPatchedVersion {
+                                                identifier
+                                            }
+                                        severity 
+                                        vulnerableVersionRange 
+                                        advisory {
+                                            description
+                                            summary
+                                            ghsaId 
+                                            publishedAt 
+                                            identifiers { 
+                                                type 
+                                                value 
+                                            } 
+                                        } 
+                                    } 
+                                }
+                                pageInfo {
+                                    hasNextPage
+                                    endCursor
+                                }
+                            } 
+                        }
+                    }`);
+                    return promise.then(function (result) {
+                        return result;
+                    }).catch(function (error) {
+                        return error.response;
+                    });
+                }));
+
+                // dependabotAlertsPromiseReposResults.forEach(element => {
+                //     console.log(element.repository.vulnerabilityAlerts)
+                // });
+
+                console.log(dependabotAlertsPromiseReposResults.length)
+
+                for (var p = 0; p < dependabotAlertsPromiseReposResults.length; p++) {
+
+                    console.log(dependabotAlertsPromiseReposResults[p].repository.name + ":" + dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes.length)
+
+                    
+                    for (var q = 0; q < dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes.length; q++) {
+
+                        // console.log(dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.vulnerableVersionRange)
+
+                        //console.log( dependabotAlertsPromiseReposResults[p].repository.name + ":" + dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes.length )
+
+                        repository = dependabotAlertsPromiseReposResults[p].repository.name
+                        organization = dependabotAlertsPromiseReposResults[p].repository.owner.login
+                        createdAt = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].createdAt.split("T")[0]
+                        packageName = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.package.name
+                        ecosystem = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.package.ecosystem
+                        severity = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.severity
+                        state =  dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].state
+                        description = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.advisory.description
+
+                        if (dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability != null) {
+                            vulnerableVersionRange = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.vulnerableVersionRange
+                        }
+
+                        summary = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.advisory.summary
+                        identifierValueLength = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.advisory.identifiers.length
+
+                        for (var s = 0; s < identifierValueLength; s++) {
+                            identifierValue = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.advisory.identifiers[s].value
+                            identifierType = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.advisory.identifiers[s].type
+
+                            if (identifierType == "CVE") {
+                                CVEidentifier = identifierValue
+                            }
+                        }
+
+                        if (dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.firstPatchedVersion != null) {
+                            firstPatchedVersion = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].securityVulnerability.firstPatchedVersion.identifier
+                        } else {
+                            firstPatchedVersion = "Not patched"
+                        }
+
+                        // dismissReason = ""
+                        // fixedAt = ""
+                        // dismissedAt = ""
+
+                        fixedAt = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].fixedAt //.split("T")[0]
+                        dismissedAt = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].dismissedAt //.split("T")[0]
+                        dismissReason = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].dismissReason
+
+                        // if ( state == "OPEN") {
+                        //     fixedAt = ""
+                        // }
+                        // else if ( state == "FIXED" ) {
+                        //     fixedAt = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].fixedAt.split("T")[0]
+                        // }
+                        // else if ( state == "DISMISSED") {
+                        //     dismissedAt = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].dismissedAt.split("T")[0]
+                        //     dismissReason = dependabotAlertsPromiseReposResults[p].repository.vulnerabilityAlerts.nodes[q].dismissReason
+                        // }
+
+                        dependabotAlertsReposResults.push({
+                            "organization": organization,
+                            "repository": repository,
+                            Package_Name: packageName,
+                            Ecosystem: ecosystem,
+                            VulnerableVersionRange: vulnerableVersionRange,
+                            Severity: severity,
+                            State: state,
+                            Summary: summary,
+                            Description: description,
+                            CVE: CVEidentifier,
+                            CreatedAt: createdAt,
+                            fixedAt: fixedAt,
+                            dismissedAt: dismissedAt,
+                            dismissReason: dismissReason,
+                            firstPatchedVersion: firstPatchedVersion
+                        })
+                    }
+                }
+
+                for (var l = 0; l < dependabotAlertsRepos.length; l++) {
+                    dependabotquery.owner = dependabotAlertsRepos[l].organization
+                    dependabotquery.reponame = dependabotAlertsRepos[l].repository
+
+                    delete dependabotquery['cursor']
+                    dhasNext = true
+
+                    while (dhasNext) {
+                        var alert_result = await graphql(dependabotquery);
+                        alert_result_length = alert_result.repository.vulnerabilityAlerts.nodes.length
+
+                        //console.log(dependabotAlertsRepos[l].repository + ": " + alert_result_length)
+
+                        dependabotquery.cursor = alert_result.repository.vulnerabilityAlerts.pageInfo.endCursor;
+                        dhasNext = JSON.parse(JSON.stringify(alert_result)).repository.vulnerabilityAlerts.pageInfo.hasNextPage
+
+                        for (var y = 0; y < alert_result_length; y++) {
+                            packageName = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.package.name
+                            ecosystem = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.package.ecosystem
+                            severity = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.severity
+                            vulnerableVersionRange = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.vulnerableVersionRange
+                            createdAt = alert_result.repository.vulnerabilityAlerts.nodes[y].createdAt.split("T")[0]
+                            state = alert_result.repository.vulnerabilityAlerts.nodes[y].state
+                            summary = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.advisory.summary
+
+                            identifierValueLength = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.advisory.identifiers.length
+
+                            var CVEidentifier
+
+                            for (var q = 0; q < identifierValueLength; q++) {
+                                identifierValue = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.advisory.identifiers[q].value
+                                identifierType = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.advisory.identifiers[q].type
+
+                                if (identifierType == "CVE") {
+                                    CVEidentifier = identifierValue
+                                }
+                            }
+
+                            if (alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.firstPatchedVersion != null) {
+                                firstPatchedVersion = alert_result.repository.vulnerabilityAlerts.nodes[y].securityVulnerability.firstPatchedVersion.identifier
+                            }
+
+                            // dismissReason = ""
+                            // fixedAt = ""
+                            // dismissedAt = ""
+
+                            fixedAt = alert_result.repository.vulnerabilityAlerts.nodes[y].fixedAt //.split("T")[0]
+                            dismissedAt = alert_result.repository.vulnerabilityAlerts.nodes[y].dismissedAt //.split("T")[0]
+                            dismissReason = alert_result.repository.vulnerabilityAlerts.nodes[y].dismissReason
+    
+                            // if ( state == "OPEN") {
+                            //     fixedAt = ""
+                            // }
+                            // else if ( state == "FIXED" ) {
+                            //     fixedAt = alert_result.repository.vulnerabilityAlerts.nodes[y].fixedAt.split("T")[0]
+    
+                            // }
+                            // else if ( state == "DISMISSED") {
+                            //     dismissedAt = alert_result.repository.vulnerabilityAlerts.nodes[y].dismissedAt.split("T")[0]
+                            //     dismissReason = alert_result.repository.vulnerabilityAlerts.nodes[y].nodes[q].dismissReason
+                            // }
+
+                            dependabotAlertsReposResults.push({
+                                "organization": dependabotAlertsRepos[l].organization,
+                                "repository": dependabotAlertsRepos[l].repository,
+                                Package_Name: packageName,
+                                Ecosystem: ecosystem,
+                                VulnerableVersionRange: vulnerableVersionRange,
+                                Severity: severity,
+                                State: state,
+                                Summary: summary,
+                                Description: description,
+                                CVE: CVEidentifier,
+                                CreatedAt: createdAt,
+                                fixedAt: fixedAt,
+                                dismissedAt: dismissedAt,
+                                dismissReason: dismissReason,
+                                firstPatchedVersion: firstPatchedVersion
+                            })
+                        }
+                    }
+                }
+            }
+        }
+
+        let result = dependabotAlertsReposResults.map(obj => {
+            let data = metrics_data.find(item => item.repository === obj.repository);
+            return {...obj, ...data}
+          });
+
+        var fields = ["organization", "repository", "repoTopic", "Package_Name", "Ecosystem", "VulnerableVersionRange", "Severity", "State", "Summary", "Description", "CVE", "CreatedAt", "fixedAt", "dismissedAt", "dismissReason", "firstPatchedVersion", "repoAdmin"]
+        var json2csvParser = new Json2csvParser({
+            fields,
+            delimiter: ",",
+        });
+
+        var dependabot_alerts_data = json2csvParser.parse(result)
+        outputFile.push("dependabot_alerts_data");
+        write.sync(outputPath + outputFile[outputFile.length - 1] + ".csv", dependabot_alerts_data, {
+            newline: true
+        });
+
+    } catch (error) {
+        console.log("Request failed:", error);
+    }
+}
+
+getDependabotAlerts()
+
+
