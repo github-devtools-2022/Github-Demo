@@ -1,5 +1,7 @@
-a = 5
-b = 3
-c = a + b
-print(c)
-Print(a+b)  
+def factorial(n):
+    if n == 1:
+        return 1
+    else:
+        return n * factorial(n-1)
+      result = factorial(5)
+print(result)
